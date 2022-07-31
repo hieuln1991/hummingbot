@@ -1,42 +1,50 @@
-# -*- coding: utf-8 -*-
-
 import asyncio
-import logging
 import json
-
-from typing import Any, Dict, List, AsyncIterable, Optional, Tuple
-from datetime import datetime, timedelta
+import logging
 from async_timeout import timeout
+from datetime import datetime, timedelta
 from decimal import Decimal
-from libc.stdint cimport int64_t
+from typing import Any, AsyncIterable, Dict, List, Optional, TYPE_CHECKING
 
 import aiohttp
-import pandas as pd
-
 from aiohttp.client_exceptions import ContentTypeError
-
-from hummingbot.logger import HummingbotLogger
-from hummingbot.core.network_iterator import NetworkStatus
-from hummingbot.core.data_type.order_book cimport OrderBook
-from hummingbot.core.data_type.cancellation_result import CancellationResult
-from hummingbot.core.data_type.limit_order import LimitOrder
-from hummingbot.core.clock cimport Clock
-from hummingbot.core.utils.tracking_nonce import get_tracking_nonce
-from hummingbot.core.utils.estimate_fee import estimate_fee
-from hummingbot.core.utils.async_utils import safe_ensure_future, safe_gather
-from hummingbot.connector.exchange_base cimport ExchangeBase
-from hummingbot.connector.trading_rule cimport TradingRule
-from hummingbot.core.event.events import MarketEvent, BuyOrderCompletedEvent, SellOrderCompletedEvent, \
-    OrderFilledEvent, OrderCancelledEvent, BuyOrderCreatedEvent, OrderExpiredEvent, SellOrderCreatedEvent, \
-    MarketTransactionFailureEvent, MarketOrderFailureEvent, OrderType, TradeType, TradeFee
+from libc.stdint cimport int64_t
 
 from hummingbot.connector.exchange.beaxy.beaxy_api_order_book_data_source import BeaxyAPIOrderBookDataSource
-from hummingbot.connector.exchange.beaxy.beaxy_constants import BeaxyConstants
 from hummingbot.connector.exchange.beaxy.beaxy_auth import BeaxyAuth
-from hummingbot.connector.exchange.beaxy.beaxy_order_book_tracker import BeaxyOrderBookTracker
+from hummingbot.connector.exchange.beaxy.beaxy_constants import BeaxyConstants
 from hummingbot.connector.exchange.beaxy.beaxy_in_flight_order import BeaxyInFlightOrder
+from hummingbot.connector.exchange.beaxy.beaxy_misc import BeaxyIOError
+from hummingbot.connector.exchange.beaxy.beaxy_order_book_tracker import BeaxyOrderBookTracker
 from hummingbot.connector.exchange.beaxy.beaxy_user_stream_tracker import BeaxyUserStreamTracker
-from hummingbot.connector.exchange.beaxy.beaxy_misc import split_trading_pair, trading_pair_to_symbol, BeaxyIOError
+from hummingbot.connector.exchange_base cimport ExchangeBase
+from hummingbot.connector.trading_rule cimport TradingRule
+from hummingbot.core.clock cimport Clock
+from hummingbot.core.data_type.cancellation_result import CancellationResult
+from hummingbot.core.data_type.limit_order import LimitOrder
+from hummingbot.core.data_type.order_book cimport OrderBook
+from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee
+from hummingbot.core.event.events import (
+    BuyOrderCompletedEvent,
+    BuyOrderCreatedEvent,
+    MarketEvent,
+    MarketOrderFailureEvent,
+    MarketTransactionFailureEvent,
+    OrderCancelledEvent,
+    OrderExpiredEvent,
+    OrderFilledEvent,
+    SellOrderCompletedEvent,
+    SellOrderCreatedEvent,
+)
+from hummingbot.core.data_type.common import OrderType, TradeType
+from hummingbot.core.network_iterator import NetworkStatus
+from hummingbot.core.utils.async_utils import safe_ensure_future, safe_gather
+from hummingbot.core.utils.estimate_fee import estimate_fee
+from hummingbot.core.utils.tracking_nonce import get_tracking_nonce
+from hummingbot.logger import HummingbotLogger
+
+if TYPE_CHECKING:
+    from hummingbot.client.config.config_helpers import ClientConfigAdapter
 
 s_logger = None
 s_decimal_0 = Decimal('0.0')
@@ -57,7 +65,7 @@ cdef class BeaxyExchangeTransactionTracker(TransactionTracker):
 cdef class BeaxyExchange(ExchangeBase):
     MARKET_BUY_ORDER_COMPLETED_EVENT_TAG = MarketEvent.BuyOrderCompleted.value
     MARKET_SELL_ORDER_COMPLETED_EVENT_TAG = MarketEvent.SellOrderCompleted.value
-    MARKET_ORDER_CANCELLED_EVENT_TAG = MarketEvent.OrderCancelled.value
+    MARKET_ORDER_CANCELED_EVENT_TAG = MarketEvent.OrderCancelled.value
     MARKET_ORDER_FAILURE_EVENT_TAG = MarketEvent.OrderFailure.value
     MARKET_ORDER_EXPIRED_EVENT_TAG = MarketEvent.OrderExpired.value
     MARKET_ORDER_FILLED_EVENT_TAG = MarketEvent.OrderFilled.value
@@ -78,16 +86,17 @@ cdef class BeaxyExchange(ExchangeBase):
 
     def __init__(
         self,
+        client_config_map: "ClientConfigAdapter",
         beaxy_api_key: str,
         beaxy_secret_key: str,
         poll_interval: float = 5.0,  # interval which the class periodically pulls status from the rest API
         trading_pairs: Optional[List[str]] = None,
         trading_required: bool = True
     ):
-        super().__init__()
+        super().__init__(client_config_map)
         self._trading_required = trading_required
         self._beaxy_auth = BeaxyAuth(beaxy_api_key, beaxy_secret_key)
-        self._order_book_tracker = BeaxyOrderBookTracker(trading_pairs=trading_pairs)
+        self._set_order_book_tracker(BeaxyOrderBookTracker(trading_pairs=trading_pairs))
         self._order_not_found_records = {}
         self._user_stream_tracker = BeaxyUserStreamTracker(beaxy_auth=self._beaxy_auth)
         self._ev_loop = asyncio.get_event_loop()
@@ -109,19 +118,13 @@ cdef class BeaxyExchange(ExchangeBase):
         self._taker_fee_percentage = {}
 
     @staticmethod
-    def split_trading_pair(trading_pair: str) -> Optional[Tuple[str, str]]:
-        return split_trading_pair(trading_pair)
+    async def convert_from_exchange_trading_pair(exchange_trading_pair: str) -> Optional[str]:
+        trading_pair = await BeaxyAPIOrderBookDataSource.trading_pair_associated_to_exchange_symbol(exchange_trading_pair)
+        return trading_pair
 
     @staticmethod
-    def convert_from_exchange_trading_pair(exchange_trading_pair: str) -> Optional[str]:
-        if BeaxyExchange.split_trading_pair(exchange_trading_pair) is None:
-            return None
-        base_asset, quote_asset = BeaxyExchange.split_trading_pair(exchange_trading_pair)
-        return f'{base_asset}-{quote_asset}'
-
-    @staticmethod
-    def convert_to_exchange_trading_pair(hb_trading_pair: str) -> str:
-        return hb_trading_pair
+    async def convert_to_exchange_trading_pair(hb_trading_pair: str) -> str:
+        return await BeaxyAPIOrderBookDataSource.exchange_symbol_associated_to_pair(hb_trading_pair)
 
     @property
     def name(self) -> str:
@@ -138,7 +141,7 @@ cdef class BeaxyExchange(ExchangeBase):
         Get mapping of all the order books that are being tracked.
         :return: Dict[trading_pair : OrderBook]
         """
-        return self._order_book_tracker.order_books
+        return self.order_book_tracker.order_books
 
     @property
     def beaxy_auth(self) -> BeaxyAuth:
@@ -159,7 +162,7 @@ cdef class BeaxyExchange(ExchangeBase):
         This is used by `ready` method below to determine if a market is ready for trading.
         """
         return {
-            'order_books_initialized': self._order_book_tracker.ready,
+            'order_books_initialized': self.order_book_tracker.ready,
             'account_balance': len(self._account_balances) > 0 if self._trading_required else True,
             'trading_rule_initialized': len(self._trading_rules) > 0 if self._trading_required else True
         }
@@ -210,14 +213,6 @@ cdef class BeaxyExchange(ExchangeBase):
             for key, value in saved_states.items()
         })
 
-    async def get_active_exchange_markets(self) -> pd.DataFrame:
-        """
-        *required
-        Used by the discovery strategy to read order books of all actively trading markets,
-        and find opportunities to profit
-        """
-        return await BeaxyAPIOrderBookDataSource.get_active_exchange_markets()
-
     cdef c_start(self, Clock clock, double timestamp):
         """
         *required
@@ -233,7 +228,7 @@ cdef class BeaxyExchange(ExchangeBase):
         """
         self.logger().debug(f'Starting beaxy network. Trading required is {self._trading_required}')
         self._stop_network()
-        self._order_book_tracker.start()
+        self.order_book_tracker.start()
         self.logger().debug('OrderBookTracker started, starting polling tasks.')
         if self._trading_required:
             self._auth_polling_task = safe_ensure_future(self._beaxy_auth._auth_token_polling_loop())
@@ -274,7 +269,7 @@ cdef class BeaxyExchange(ExchangeBase):
         """
         Synchronous function that handles when a single market goes offline
         """
-        self._order_book_tracker.stop()
+        self.order_book_tracker.stop()
         if self._status_polling_task is not None:
             self._status_polling_task.cancel()
         if self._user_stream_tracker_task is not None:
@@ -293,7 +288,8 @@ cdef class BeaxyExchange(ExchangeBase):
         """
 
         if self._in_flight_orders:
-            from_date = min(order.created_at for order in self._in_flight_orders.values())
+            timestamp = min(order.creation_timestamp for order in self._in_flight_orders.values())
+            from_date = datetime.utcfromtimestamp(timestamp)
         else:
             from_date = datetime.utcnow() - timedelta(minutes=5)
 
@@ -352,7 +348,7 @@ cdef class BeaxyExchange(ExchangeBase):
                 )
                 tracked_order.last_state = 'CLOSED'
                 self.c_trigger_event(
-                    self.MARKET_ORDER_CANCELLED_EVENT_TAG,
+                    self.MARKET_ORDER_CANCELED_EVENT_TAG,
                     OrderCancelledEvent(self._current_timestamp, client_order_id)
                 )
                 self.c_stop_tracking_order(client_order_id)
@@ -389,7 +385,7 @@ cdef class BeaxyExchange(ExchangeBase):
                             execute_price,
                             execute_amount_diff,
                         ),
-                        exchange_trade_id=exchange_order_id,
+                        exchange_trade_id=str(int(self._time() * 1e6)),
                     )
                     self.logger().info(f'Filled {execute_amount_diff} out of {tracked_order.amount} of the '
                                        f'{order_type_description} order {client_order_id}.')
@@ -425,7 +421,7 @@ cdef class BeaxyExchange(ExchangeBase):
                                 execute_price,
                                 execute_amount_diff,
                             ),
-                            exchange_trade_id=exchange_order_id,
+                            exchange_trade_id=str(int(self._time() * 1e6)),
                         )
                         self.logger().info(f'Filled {execute_amount_diff} out of {tracked_order.amount} of the '
                                            f'{order_type_description} order {client_order_id}.')
@@ -439,11 +435,8 @@ cdef class BeaxyExchange(ExchangeBase):
                                                                     tracked_order.client_order_id,
                                                                     tracked_order.base_asset,
                                                                     tracked_order.quote_asset,
-                                                                    (tracked_order.fee_asset
-                                                                     or tracked_order.base_asset),
                                                                     tracked_order.executed_amount_base,
                                                                     tracked_order.executed_amount_quote,
-                                                                    tracked_order.fee_paid,
                                                                     tracked_order.order_type))
                     else:
                         self.logger().info(f'The market sell order {tracked_order.client_order_id} has completed '
@@ -453,17 +446,14 @@ cdef class BeaxyExchange(ExchangeBase):
                                                                      tracked_order.client_order_id,
                                                                      tracked_order.base_asset,
                                                                      tracked_order.quote_asset,
-                                                                     (tracked_order.fee_asset
-                                                                      or tracked_order.quote_asset),
                                                                      tracked_order.executed_amount_base,
                                                                      tracked_order.executed_amount_quote,
-                                                                     tracked_order.fee_paid,
                                                                      tracked_order.order_type))
                 else:
                     self.logger().info(f'The market order {tracked_order.client_order_id} has failed/been cancelled '
                                        f'according to order status API.')
                     tracked_order.last_state = 'cancelled'
-                    self.c_trigger_event(self.MARKET_ORDER_CANCELLED_EVENT_TAG,
+                    self.c_trigger_event(self.MARKET_ORDER_CANCELED_EVENT_TAG,
                                          OrderCancelledEvent(
                                              self._current_timestamp,
                                              tracked_order.client_order_id
@@ -478,7 +468,7 @@ cdef class BeaxyExchange(ExchangeBase):
         :returns: json response from the API
         """
         path_url = BeaxyConstants.TradingApi.CREATE_ORDER_ENDPOINT
-        trading_pair = trading_pair_to_symbol(trading_pair)  # at Beaxy all pairs listed without splitter
+        trading_pair = await self.convert_to_exchange_trading_pair(trading_pair)
         is_limit_type = order_type.is_limit_type()
 
         data = {
@@ -502,7 +492,8 @@ cdef class BeaxyExchange(ExchangeBase):
         object order_type,
         object order_side,
         object amount,
-        object price
+        object price,
+        object is_maker = None,
     ):
         """
         *required
@@ -522,7 +513,7 @@ cdef class BeaxyExchange(ExchangeBase):
             self.logger().info(f'Fee for {pair} is not in fee cache')
             return estimate_fee('beaxy', is_maker)
 
-        return TradeFee(percent=fees[pair] / Decimal(100))
+        return AddedToCostTradeFee(percent=fees[pair] / Decimal(100))
 
     async def execute_buy(
         self,
@@ -560,7 +551,8 @@ cdef class BeaxyExchange(ExchangeBase):
                                                       trading_pair,
                                                       decimal_amount,
                                                       decimal_price,
-                                                      order_id))
+                                                      order_id,
+                                                      tracked_order.creation_timestamp))
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -632,7 +624,8 @@ cdef class BeaxyExchange(ExchangeBase):
                                                        trading_pair,
                                                        decimal_amount,
                                                        decimal_price,
-                                                       order_id))
+                                                       order_id,
+                                                       tracked_order.creation_timestamp))
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -685,7 +678,7 @@ cdef class BeaxyExchange(ExchangeBase):
             if e.result and 'Active order not found or already cancelled.' in e.result['items']:
                 # The order was never there to begin with. So cancelling it is a no-op but semantically successful.
                 self.c_stop_tracking_order(order_id)
-                self.c_trigger_event(self.MARKET_ORDER_CANCELLED_EVENT_TAG,
+                self.c_trigger_event(self.MARKET_ORDER_CANCELED_EVENT_TAG,
                                      OrderCancelledEvent(self._current_timestamp, order_id))
                 return order_id
         except IOError as ioe:
@@ -747,9 +740,9 @@ cdef class BeaxyExchange(ExchangeBase):
         try:
             res = await self._api_request('get', BeaxyConstants.TradingApi.TRADE_SETTINGS_ENDPOINT)
             for symbol_data in res['symbols']:
-                symbol = self.convert_from_exchange_trading_pair(symbol_data['name'])
-                self._maker_fee_percentage[symbol] = Decimal(str(symbol_data['maker_fee']))
-                self._taker_fee_percentage[symbol] = Decimal(str(symbol_data['taker_fee']))
+                trading_pair = f"{symbol_data['base']}-{symbol_data['term']}"
+                self._maker_fee_percentage[trading_pair] = Decimal(str(symbol_data['maker_fee']))
+                self._taker_fee_percentage[trading_pair] = Decimal(str(symbol_data['taker_fee']))
 
             self._last_fee_percentage_update_timestamp = current_timestamp
         except asyncio.CancelledError:
@@ -796,7 +789,7 @@ cdef class BeaxyExchange(ExchangeBase):
         try:
             if current_tick > last_tick or len(self._trading_rules) <= 0:
                 product_info = await self._api_request(http_method='get', url=BeaxyConstants.PublicApi.SYMBOLS_URL, is_auth_required=False)
-                trading_rules_list = self._format_trading_rules(product_info)
+                trading_rules_list = await self._format_trading_rules(product_info)
                 self._trading_rules.clear()
                 for trading_rule in trading_rules_list:
 
@@ -807,7 +800,7 @@ cdef class BeaxyExchange(ExchangeBase):
         except Exception:
             self.logger().warning('Got exception while updating trading rules.', exc_info=True)
 
-    def _format_trading_rules(self, market_dict: Dict[str, Any]) -> List[TradingRule]:
+    async def _format_trading_rules(self, market_dict: Dict[str, Any]) -> List[TradingRule]:
         """
         Turns json data from API into TradingRule instances
         :returns: List of TradingRule
@@ -817,7 +810,7 @@ cdef class BeaxyExchange(ExchangeBase):
 
         for rule in market_dict:
             try:
-                trading_pair = rule.get('symbol')
+                trading_pair = await self.convert_from_exchange_trading_pair(rule.get('symbol'))
                 # Parsing from string doesn't mess up the precision
                 retval.append(TradingRule(trading_pair,
                                           min_price_increment=Decimal(str(rule.get('tickSize'))),
@@ -912,7 +905,7 @@ cdef class BeaxyExchange(ExchangeBase):
                                                          execute_price,
                                                          execute_amount_diff,
                                                      ),
-                                                     exchange_trade_id=exchange_order_id
+                                                     exchange_trade_id=str(int(self._time() * 1e6)),
                                                  ))
 
                     elif order_status == 'completely_filled':
@@ -944,7 +937,7 @@ cdef class BeaxyExchange(ExchangeBase):
                                     execute_price,
                                     execute_amount_diff,
                                 ),
-                                exchange_trade_id=exchange_order_id,
+                                exchange_trade_id=str(int(self._time() * 1e6)),
                             )
                             self.logger().info(f'Filled {execute_amount_diff} out of {tracked_order.amount} of the '
                                                f'{order_type_description} order {client_order_id}.')
@@ -958,11 +951,8 @@ cdef class BeaxyExchange(ExchangeBase):
                                                                         tracked_order.client_order_id,
                                                                         tracked_order.base_asset,
                                                                         tracked_order.quote_asset,
-                                                                        (tracked_order.fee_asset
-                                                                         or tracked_order.base_asset),
                                                                         tracked_order.executed_amount_base,
                                                                         tracked_order.executed_amount_quote,
-                                                                        tracked_order.fee_paid,
                                                                         tracked_order.order_type))
                         else:
                             self.logger().info(f'The market sell order {tracked_order.client_order_id} has completed '
@@ -972,18 +962,15 @@ cdef class BeaxyExchange(ExchangeBase):
                                                                          tracked_order.client_order_id,
                                                                          tracked_order.base_asset,
                                                                          tracked_order.quote_asset,
-                                                                         (tracked_order.fee_asset
-                                                                          or tracked_order.quote_asset),
                                                                          tracked_order.executed_amount_base,
                                                                          tracked_order.executed_amount_quote,
-                                                                         tracked_order.fee_paid,
                                                                          tracked_order.order_type))
 
                         self.c_stop_tracking_order(tracked_order.client_order_id)
 
                     elif order_status == 'canceled':
                         tracked_order.last_state = 'canceled'
-                        self.c_trigger_event(self.MARKET_ORDER_CANCELLED_EVENT_TAG,
+                        self.c_trigger_event(self.MARKET_ORDER_CANCELED_EVENT_TAG,
                                              OrderCancelledEvent(self._current_timestamp, tracked_order.client_order_id))
                         self.c_stop_tracking_order(tracked_order.client_order_id)
                     elif order_status in ['rejected', 'replaced', 'suspended']:
@@ -1126,7 +1113,7 @@ cdef class BeaxyExchange(ExchangeBase):
         :returns: OrderBook for a specific trading pair
         """
         cdef:
-            dict order_books = self._order_book_tracker.order_books
+            dict order_books = self.order_book_tracker.order_books
 
         if trading_pair not in order_books:
             raise ValueError(f'No order book exists for "{trading_pair}".')
@@ -1150,7 +1137,7 @@ cdef class BeaxyExchange(ExchangeBase):
             trade_type,
             price,
             amount,
-            created_at=datetime.utcnow()
+            creation_timestamp=self._current_timestamp
         )
 
     cdef c_did_timeout_tx(self, str tracking_id):
@@ -1220,8 +1207,17 @@ cdef class BeaxyExchange(ExchangeBase):
                 order_type: OrderType,
                 order_side: TradeType,
                 amount: Decimal,
-                price: Decimal = s_decimal_NaN) -> TradeFee:
-        return self.c_get_fee(base_currency, quote_currency, order_type, order_side, amount, price)
+                price: Decimal = s_decimal_NaN,
+                is_maker: Optional[bool] = None) -> AddedToCostTradeFee:
+        return self.c_get_fee(base_currency, quote_currency, order_type, order_side, amount, price, is_maker)
 
     def get_order_book(self, trading_pair: str) -> OrderBook:
         return self.c_get_order_book(trading_pair)
+
+    async def all_trading_pairs(self) -> List[str]:
+        # This method should be removed and instead we should implement _initialize_trading_pair_symbol_map
+        return await BeaxyAPIOrderBookDataSource.fetch_trading_pairs()
+
+    async def get_last_traded_prices(self, trading_pairs: List[str]) -> Dict[str, float]:
+        # This method should be removed and instead we should implement _get_last_traded_price
+        return await BeaxyAPIOrderBookDataSource.get_last_traded_prices(trading_pairs=trading_pairs)

@@ -1,39 +1,62 @@
 #!/usr/bin/env python
 
 connector_status = {
+    'altmarkets': 'green',
     'ascend_ex': 'yellow',
     'balancer': 'green',
     'beaxy': 'green',
     'binance': 'green',
     'binance_perpetual': 'yellow',
     'binance_perpetual_testnet': 'yellow',
-    'binance_us': 'yellow',
+    'binance_us': 'green',
     'bitfinex': 'yellow',
+    'bitmart': 'green',
     'bittrex': 'yellow',
-    'blocktane': 'green',
-    'celo': 'green',
+    'bitmex': 'yellow',
+    'bitmex_perpetual': 'yellow',
+    'bitmex_testnet': 'yellow',
+    'bitmex_perpetual_testnet': 'yellow',
+    'blocktane': 'yellow',
+    'bybit_perpetual': 'yellow',
+    'bybit_perpetual_testnet': 'yellow',
+    'bybit_testnet': 'yellow',
+    'bybit': 'green',
+    'celo': 'yellow',
     'coinbase_pro': 'yellow',
+    'coinflex': 'green',
+    'coinflex_test': 'yellow',
+    'coinflex_perpetual': 'yellow',
+    'coinflex_perpetual_testnet': 'yellow',
     'coinzoom': 'yellow',
-    'crypto_com': 'yellow',
+    'crypto_com': 'green',
     'digifinex': "yellow",
-    'dydx': 'green',
+    'dydx_perpetual': 'yellow',
     'ethereum': 'red',
-    'hitbtc': 'yellow',
-    'huobi': 'green',
+    'ftx': 'yellow',
+    'gate_io': 'green',
+    'hitbtc': 'green',
+    'huobi': 'yellow',
     'kraken': 'green',
-    'kucoin': 'green',
-    'liquid': 'yellow',
+    'kucoin': 'yellow',
+    'kucoin_testnet': 'yellow',
+    'k2': 'red',
+    'latoken': 'yellow',
+    'liquid': 'green',
     'loopring': 'yellow',
-    'okex': 'yellow',
+    'mexc': 'yellow',
+    'ndax': 'yellow',
+    'ndax_testnet': 'yellow',
+    'okx': 'green',
     'perpetual_finance': 'yellow',
     'probit': 'yellow',
     'probit_kr': 'yellow',
-    'terra': 'green',
-    'uniswap': 'green'
+    'terra': 'red',
+    'uniswap': 'yellow',
+    'uniswap_v3': 'yellow',
+    'wazirx': 'yellow'
 }
 
 warning_messages = {
-    'eterbase': 'Hack investigation and security audit is ongoing for Eterbase. Trading is currently disabled.'
 }
 
 
@@ -48,5 +71,5 @@ def get_connector_status(connector_name: str) -> str:
     if connector_name not in connector_status.keys():
         status = "UNKNOWN"
     else:
-        return connector_status[connector_name].upper()
+        return f"&c{connector_status[connector_name].upper()}"
     return status
